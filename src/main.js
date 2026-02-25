@@ -46,8 +46,8 @@ function extractSellerIdFromHref(href) {
 
 // ─── BROWSER SETUP ─────────────────────────────────────────────────────────────
 
-async function launchBrowser() {
-  const browser = await chromium.launch({
+async function launchBrowser(proxyUrl) {
+  const launchOptions = {
     headless: true,
     args: [
       "--disable-blink-features=AutomationControlled",
@@ -55,7 +55,15 @@ async function launchBrowser() {
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
     ],
-  });
+  };
+
+  // Add proxy if configured
+  if (proxyUrl) {
+    launchOptions.proxy = { server: proxyUrl };
+    log(`Using proxy: ${proxyUrl.replace(/:[^:]+@/, ":***@")}`);
+  }
+
+  const browser = await chromium.launch(launchOptions);
 
   const context = await browser.newContext({
     userAgent:
@@ -163,32 +171,49 @@ async function scrapeAllOffers(page) {
     return [];
   }
 
-  const sellers = await page.$$eval("#aod-offer-list #aod-offer", (offers) => {
-    return offers
-      .map((offer) => {
-        const link = offer.querySelector('a[href*="/gp/aag/main"]');
-        if (!link) return null;
-        const href = link.getAttribute("href");
-        const name = link.textContent.trim();
-        let sellerId = null;
-        try {
-          sellerId = new URL(href, window.location.origin).searchParams.get("seller");
-        } catch {
-          const m = href.match(/seller=([A-Z0-9]+)/);
-          sellerId = m ? m[1] : null;
-        }
-        if (!sellerId) return null;
+  // Scrape BOTH the pinned offer AND the offer list
+  const sellers = await page.evaluate(() => {
+    function parseOffer(offer) {
+      const link = offer.querySelector('a[href*="/gp/aag/main"]');
+      if (!link) return null;
+      const href = link.getAttribute("href");
+      const name = link.textContent.trim();
+      let sellerId = null;
+      try {
+        sellerId = new URL(href, window.location.origin).searchParams.get("seller");
+      } catch {
+        const m = href.match(/seller=([A-Z0-9]+)/);
+        sellerId = m ? m[1] : null;
+      }
+      if (!sellerId) return null;
 
-        const shipsFromEl = offer.querySelector("#aod-offer-shipsFrom .a-col-right");
-        const shipsFrom = shipsFromEl
-          ? shipsFromEl.innerText.replace(/Dispatches from|Ships from/gi, "").replace(/\n/g, " ").trim()
-          : "";
-        const priceEl = offer.querySelector(".a-price .a-offscreen");
-        const price = priceEl ? priceEl.textContent.trim() : "";
+      const shipsFromEl = offer.querySelector('[id*="shipsFrom"] .a-col-right');
+      const shipsFrom = shipsFromEl
+        ? shipsFromEl.innerText.replace(/Dispatches from|Ships from/gi, "").replace(/\n/g, " ").trim()
+        : "";
+      const priceEl = offer.querySelector(".a-price .a-offscreen");
+      const price = priceEl ? priceEl.textContent.trim() : "";
 
-        return { name, sellerId, shipsFrom, price };
-      })
-      .filter(Boolean);
+      return { name, sellerId, shipsFrom, price };
+    }
+
+    const results = [];
+
+    // 1. Pinned offer (featured/buy-box offer at top of AOD panel)
+    const pinned = document.querySelector("#aod-pinned-offer");
+    if (pinned) {
+      const s = parseOffer(pinned);
+      if (s) results.push(s);
+    }
+
+    // 2. All other offers in the list
+    const offers = document.querySelectorAll("#aod-offer-list #aod-offer");
+    for (const offer of offers) {
+      const s = parseOffer(offer);
+      if (s) results.push(s);
+    }
+
+    return results;
   });
 
   const unique = [...new Map(sellers.map((s) => [s.sellerId, s])).values()];
@@ -343,6 +368,7 @@ const {
   marketplaces: marketplaceFilter = [],
   delayBetweenRequests = 3000,
   skipAmazonSellers = true,
+  proxyConfiguration = null,
 } = input;
 
 // Resolve which ASINs to process
@@ -357,7 +383,24 @@ const marketplaces =
 log(`Config: ${asinsToProcess.length} ASINs × ${marketplaces.length} marketplaces`);
 log(`Delay: ~${delayBetweenRequests}ms | Skip Amazon sellers: ${skipAmazonSellers}`);
 
-const { browser, context } = await launchBrowser();
+// Build proxy URL from Apify proxy config
+let proxyUrl = null;
+if (proxyConfiguration?.useApifyProxy) {
+  const groups = proxyConfiguration.apifyProxyGroups?.length
+    ? proxyConfiguration.apifyProxyGroups.join("+")
+    : "RESIDENTIAL";
+  const country = proxyConfiguration.apifyProxyCountry || "GB";
+  const password = process.env.APIFY_PROXY_PASSWORD;
+  if (password) {
+    proxyUrl = `http://groups-${groups},country-${country}:${password}@proxy.apify.com:8000`;
+  } else {
+    log(`⚠ APIFY_PROXY_PASSWORD not set — running without proxy`);
+  }
+} else if (proxyConfiguration?.proxyUrls?.length) {
+  proxyUrl = proxyConfiguration.proxyUrls[0];
+}
+
+const { browser, context } = await launchBrowser(proxyUrl);
 
 try {
   for (const asin of asinsToProcess) {
