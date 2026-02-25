@@ -1,0 +1,10 @@
+{
+  "asins": [
+    "B07YDVWL4J",
+    "B0CT3WRFD9"
+  ],
+  "maxAsins": 2,
+  "marketplaces": [],
+  "delayBetweenRequests": 3000,
+  "skipAmazonSellers": true
+}

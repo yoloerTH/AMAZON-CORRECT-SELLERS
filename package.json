@@ -1,0 +1,13 @@
+{
+  "name": "amazon-seller-scraper",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Scrape Amazon seller contact info across 13 marketplaces",
+  "scripts": {
+    "start": "node src/main.js"
+  },
+  "dependencies": {
+    "apify": "^3.2.6",
+    "playwright": "^1.51.0"
+  }
+}
