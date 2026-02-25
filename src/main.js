@@ -383,14 +383,15 @@ const marketplaces =
 log(`Config: ${asinsToProcess.length} ASINs × ${marketplaces.length} marketplaces`);
 log(`Delay: ~${delayBetweenRequests}ms | Skip Amazon sellers: ${skipAmazonSellers}`);
 
-// Build proxy URL using Apify SDK's ProxyConfiguration
+// Build proxy URL using Apify's Actor.createProxyConfiguration
 let proxyUrl = null;
 if (proxyConfiguration) {
   try {
-    const { ProxyConfiguration } = await import("apify");
-    const proxy = new ProxyConfiguration(proxyConfiguration);
-    proxyUrl = await proxy.newUrl();
-    log(`Proxy test URL resolved OK`);
+    const proxy = await Actor.createProxyConfiguration(proxyConfiguration);
+    if (proxy) {
+      proxyUrl = await proxy.newUrl();
+      log(`Proxy URL resolved OK`);
+    }
   } catch (err) {
     log(`⚠ Proxy setup failed: ${err.message} — running without proxy`);
   }
