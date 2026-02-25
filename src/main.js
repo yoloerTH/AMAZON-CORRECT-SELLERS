@@ -383,21 +383,17 @@ const marketplaces =
 log(`Config: ${asinsToProcess.length} ASINs × ${marketplaces.length} marketplaces`);
 log(`Delay: ~${delayBetweenRequests}ms | Skip Amazon sellers: ${skipAmazonSellers}`);
 
-// Build proxy URL from Apify proxy config
+// Build proxy URL using Apify SDK's ProxyConfiguration
 let proxyUrl = null;
-if (proxyConfiguration?.useApifyProxy) {
-  const groups = proxyConfiguration.apifyProxyGroups?.length
-    ? proxyConfiguration.apifyProxyGroups.join("+")
-    : "RESIDENTIAL";
-  const country = proxyConfiguration.apifyProxyCountry || "GB";
-  const password = process.env.APIFY_PROXY_PASSWORD;
-  if (password) {
-    proxyUrl = `http://groups-${groups},country-${country}:${password}@proxy.apify.com:8000`;
-  } else {
-    log(`⚠ APIFY_PROXY_PASSWORD not set — running without proxy`);
+if (proxyConfiguration) {
+  try {
+    const { ProxyConfiguration } = await import("apify");
+    const proxy = new ProxyConfiguration(proxyConfiguration);
+    proxyUrl = await proxy.newUrl();
+    log(`Proxy test URL resolved OK`);
+  } catch (err) {
+    log(`⚠ Proxy setup failed: ${err.message} — running without proxy`);
   }
-} else if (proxyConfiguration?.proxyUrls?.length) {
-  proxyUrl = proxyConfiguration.proxyUrls[0];
 }
 
 const { browser, context } = await launchBrowser(proxyUrl);
