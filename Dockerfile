@@ -1,7 +1,12 @@
-FROM apify/actor-node-playwright-chrome:20
+FROM mcr.microsoft.com/playwright:v1.51.0-noble
+
+WORKDIR /app
 
 COPY package*.json ./
-RUN npm install --omit=dev --ignore-scripts \
-    && npm cache clean --force
+RUN npm install --omit=dev --ignore-scripts
 
 COPY . ./
+
+ENV APIFY_LOCAL_STORAGE_DIR=/tmp/storage
+
+CMD ["node", "src/main.js"]
