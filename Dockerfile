@@ -7,6 +7,4 @@ RUN npm install --omit=dev --ignore-scripts
 
 COPY . ./
 
-ENV APIFY_LOCAL_STORAGE_DIR=/tmp/storage
-
 CMD ["node", "src/main.js"]
