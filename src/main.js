@@ -1,4 +1,4 @@
-import { Actor } from "apify";
+import http from "http";
 import { chromium } from "playwright";
 
 // ─── MARKETPLACE DEFINITIONS ───────────────────────────────────────────────────
@@ -19,6 +19,10 @@ const ALL_MARKETPLACES = [
   { code: "TR", domain: "amazon.com.tr" },
 ];
 
+// ─── STATE ─────────────────────────────────────────────────────────────────────
+
+let currentRun = null; // { status, startedAt, input, results, logs, error }
+
 // ─── HELPERS ───────────────────────────────────────────────────────────────────
 
 function sleep(ms) {
@@ -31,7 +35,9 @@ function randomDelay(baseMs) {
 }
 
 function log(msg) {
-  console.log(`[${new Date().toISOString().slice(11, 19)}] ${msg}`);
+  const line = `[${new Date().toISOString().slice(11, 19)}] ${msg}`;
+  console.log(line);
+  if (currentRun) currentRun.logs.push(line);
 }
 
 function extractSellerIdFromHref(href) {
@@ -46,8 +52,8 @@ function extractSellerIdFromHref(href) {
 
 // ─── BROWSER SETUP ─────────────────────────────────────────────────────────────
 
-async function launchBrowser(proxyUrl) {
-  const launchOptions = {
+async function launchBrowser() {
+  const browser = await chromium.launch({
     headless: true,
     args: [
       "--disable-blink-features=AutomationControlled",
@@ -55,15 +61,7 @@ async function launchBrowser(proxyUrl) {
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
     ],
-  };
-
-  // Add proxy if configured
-  if (proxyUrl) {
-    launchOptions.proxy = { server: proxyUrl };
-    log(`Using proxy: ${proxyUrl.replace(/:[^:]+@/, ":***@")}`);
-  }
-
-  const browser = await chromium.launch(launchOptions);
+  });
 
   const context = await browser.newContext({
     userAgent:
@@ -83,7 +81,7 @@ async function launchBrowser(proxyUrl) {
 
 // ─── STEP 1: PRODUCT PAGE ──────────────────────────────────────────────────────
 
-async function scrapeProductPage(page, asin, marketplace, delay) {
+async function scrapeProductPage(page, asin, marketplace) {
   const url = `https://www.${marketplace.domain}/dp/${asin}`;
   log(`  → Product page: ${url}`);
 
@@ -95,7 +93,6 @@ async function scrapeProductPage(page, asin, marketplace, delay) {
     return { primarySeller: null, hasOtherSellers: false };
   }
 
-  // CAPTCHA check
   const html = await page.content();
   if (
     html.includes("Enter the characters you see below") ||
@@ -105,7 +102,6 @@ async function scrapeProductPage(page, asin, marketplace, delay) {
     await sleep(30000);
   }
 
-  // 404 check — only match actual error page indicators, not random page content
   const pageTitle = await page.title();
   const hasProductTitle = await page.$("#productTitle").catch(() => null);
   if (
@@ -116,7 +112,6 @@ async function scrapeProductPage(page, asin, marketplace, delay) {
     return { primarySeller: null, hasOtherSellers: false };
   }
 
-  // Primary seller
   let primarySeller = null;
   const sellerLink = await page.$("#sellerProfileTriggerId");
   if (sellerLink) {
@@ -139,7 +134,6 @@ async function scrapeProductPage(page, asin, marketplace, delay) {
     }
   }
 
-  // Other sellers
   const otherSellersBox = await page.$("#dynamic-aod-ingress-box");
   const hasOtherSellers = !!otherSellersBox;
   if (hasOtherSellers) {
@@ -171,7 +165,6 @@ async function scrapeAllOffers(page) {
     return [];
   }
 
-  // Scrape BOTH the pinned offer AND the offer list
   const sellers = await page.evaluate(() => {
     function parseOffer(offer) {
       const link = offer.querySelector('a[href*="/gp/aag/main"]');
@@ -198,21 +191,16 @@ async function scrapeAllOffers(page) {
     }
 
     const results = [];
-
-    // 1. Pinned offer (featured/buy-box offer at top of AOD panel)
     const pinned = document.querySelector("#aod-pinned-offer");
     if (pinned) {
       const s = parseOffer(pinned);
       if (s) results.push(s);
     }
-
-    // 2. All other offers in the list
     const offers = document.querySelectorAll("#aod-offer-list #aod-offer");
     for (const offer of offers) {
       const s = parseOffer(offer);
       if (s) results.push(s);
     }
-
     return results;
   });
 
@@ -220,7 +208,6 @@ async function scrapeAllOffers(page) {
   log(`  ✓ ${unique.length} unique sellers in AOD`);
   unique.forEach((s) => log(`    - ${s.name} [${s.sellerId}]`));
 
-  // Close panel
   try {
     const closeBtn = await page.$(
       'button[data-action="a-popover-close"], .aod-close-button, [aria-label="Close"]'
@@ -248,7 +235,6 @@ async function scrapeSellerProfile(page, sellerId, asin, marketplace) {
 
   const sellerName = await page.$eval("h1", (el) => el.textContent.trim()).catch(() => "Unknown");
 
-  // Parse "Detailed Seller Information" block
   const info = await page.evaluate(() => {
     const headingTexts = [
       "Detailed Seller Information",
@@ -282,9 +268,7 @@ async function scrapeSellerProfile(page, sellerId, asin, marketplace) {
       "adres firmy", "iş adresi", "事業所の住所",
     ];
 
-    // Labels that contain multi-line values (addresses)
     const multiLineLabels = [...addressLabels];
-    // Labels that must be single-line (never bleed into next line)
     const singleLinePatterns = ["vat", "ust", "iva", "nip", "kdv", "trade register", "handelsregister", "registro mercantil", "phone", "telefon", "email", "e-mail", "business type", "business name"];
 
     for (let i = 0; i < lines.length; i++) {
@@ -307,7 +291,6 @@ async function scrapeSellerProfile(page, sellerId, asin, marketplace) {
         }
         data[key] = parts.join(", ");
       } else if (isSingleLine) {
-        // Only store if we got a value on the same line — don't grab next line
         if (value) data[key] = value;
       } else if (value) {
         data[key] = value;
@@ -316,13 +299,11 @@ async function scrapeSellerProfile(page, sellerId, asin, marketplace) {
     return data;
   });
 
-  // Fallback: "Customer Service Phone" from about section (UAE/SA)
   const csPhone = await page.evaluate(() => {
     const m = document.body.innerText.match(/Customer Service Phone[:\s]+([^\n]+)/i);
     return m ? m[1].trim() : null;
   });
 
-  // Normalize keys across languages
   const out = { sellerName, sellerId };
   if (info) {
     for (const [key, value] of Object.entries(info)) {
@@ -334,7 +315,6 @@ async function scrapeSellerProfile(page, sellerId, asin, marketplace) {
       else if (k.includes("trade register") || k.includes("handelsregister") || k.includes("registro mercantil"))
         out.tradeRegisterNumber = value;
       else if (k.includes("vat") || k.includes("ust") || k.includes("iva") || k.includes("nip") || k.includes("kdv")) {
-        // Validate: VAT numbers are alphanumeric codes, not addresses
         const looksLikeVat = /^[A-Z]{0,3}\d{5,}/.test(value) || /^\d{5,}/.test(value) || value.length < 30;
         out.vatNumber = looksLikeVat ? value : "";
       }
@@ -356,177 +336,269 @@ async function scrapeSellerProfile(page, sellerId, asin, marketplace) {
   return out;
 }
 
-// ─── MAIN ──────────────────────────────────────────────────────────────────────
+// ─── SCRAPER RUNNER ────────────────────────────────────────────────────────────
 
-await Actor.init();
+async function runScraper(input) {
+  const {
+    asins = [],
+    maxAsins = 0,
+    marketplaces: marketplaceFilter = [],
+    delayBetweenRequests = 3000,
+    skipAmazonSellers = true,
+  } = input;
 
-const input = await Actor.getInput();
+  const asinsToProcess = maxAsins > 0 ? asins.slice(0, maxAsins) : asins;
+  const marketplaces =
+    marketplaceFilter.length > 0
+      ? ALL_MARKETPLACES.filter((m) => marketplaceFilter.includes(m.code))
+      : ALL_MARKETPLACES;
 
-const {
-  asins = [],
-  maxAsins = 0,
-  marketplaces: marketplaceFilter = [],
-  delayBetweenRequests = 3000,
-  skipAmazonSellers = true,
-  proxyConfiguration = null,
-} = input;
+  log(`Config: ${asinsToProcess.length} ASINs × ${marketplaces.length} marketplaces`);
+  log(`Delay: ~${delayBetweenRequests}ms | Skip Amazon sellers: ${skipAmazonSellers}`);
 
-// Resolve which ASINs to process
-const asinsToProcess = maxAsins > 0 ? asins.slice(0, maxAsins) : asins;
+  const { browser, context } = await launchBrowser();
+  const results = [];
 
-// Resolve which marketplaces to run
-const marketplaces =
-  marketplaceFilter.length > 0
-    ? ALL_MARKETPLACES.filter((m) => marketplaceFilter.includes(m.code))
-    : ALL_MARKETPLACES;
-
-log(`Config: ${asinsToProcess.length} ASINs × ${marketplaces.length} marketplaces`);
-log(`Delay: ~${delayBetweenRequests}ms | Skip Amazon sellers: ${skipAmazonSellers}`);
-
-// Build proxy URL using Apify's Actor.createProxyConfiguration
-let proxyUrl = null;
-if (proxyConfiguration) {
   try {
-    const proxy = await Actor.createProxyConfiguration(proxyConfiguration);
-    if (proxy) {
-      proxyUrl = await proxy.newUrl();
-      log(`Proxy URL resolved OK`);
-    }
-  } catch (err) {
-    log(`⚠ Proxy setup failed: ${err.message} — running without proxy`);
-  }
-}
+    for (const asin of asinsToProcess) {
+      log(`\n${"═".repeat(60)}`);
+      log(`ASIN: ${asin}`);
+      log(`${"═".repeat(60)}`);
 
-const { browser, context } = await launchBrowser(proxyUrl);
+      for (const marketplace of marketplaces) {
+        log(`\n─── ${marketplace.code} (${marketplace.domain}) ───`);
+        const page = await context.newPage();
 
-try {
-  for (const asin of asinsToProcess) {
-    log(`\n${"═".repeat(60)}`);
-    log(`ASIN: ${asin}`);
-    log(`${"═".repeat(60)}`);
+        try {
+          const { primarySeller, hasOtherSellers } = await scrapeProductPage(page, asin, marketplace);
+          const sellersToVisit = new Map();
 
-    for (const marketplace of marketplaces) {
-      log(`\n─── ${marketplace.code} (${marketplace.domain}) ───`);
-      const page = await context.newPage();
+          if (primarySeller?.sellerId) {
+            sellersToVisit.set(primarySeller.sellerId, {
+              name: primarySeller.name,
+              source: "buy_box",
+            });
+          }
 
-      try {
-        // Step 1: Product page
-        const { primarySeller, hasOtherSellers } = await scrapeProductPage(
-          page, asin, marketplace, delayBetweenRequests
-        );
-
-        const sellersToVisit = new Map();
-
-        // Primary seller (3P only)
-        if (primarySeller?.sellerId) {
-          sellersToVisit.set(primarySeller.sellerId, {
-            name: primarySeller.name,
-            source: "buy_box",
-          });
-        }
-
-        // Step 2: AOD sellers
-        if (hasOtherSellers) {
-          const aodSellers = await scrapeAllOffers(page);
-          for (const s of aodSellers) {
-            if (!sellersToVisit.has(s.sellerId)) {
-              sellersToVisit.set(s.sellerId, {
-                name: s.name,
-                source: "other_offers",
-                shipsFrom: s.shipsFrom,
-                price: s.price,
-              });
+          if (hasOtherSellers) {
+            const aodSellers = await scrapeAllOffers(page);
+            for (const s of aodSellers) {
+              if (!sellersToVisit.has(s.sellerId)) {
+                sellersToVisit.set(s.sellerId, {
+                  name: s.name,
+                  source: "other_offers",
+                  shipsFrom: s.shipsFrom,
+                  price: s.price,
+                });
+              }
             }
           }
-        }
 
-        // Skip Amazon-only listings if configured
-        if (skipAmazonSellers && sellersToVisit.size === 0 && primarySeller?.name === "Amazon") {
-          log(`  ○ Amazon-only listing, skipping`);
+          if (skipAmazonSellers && sellersToVisit.size === 0 && primarySeller?.name === "Amazon") {
+            log(`  ○ Amazon-only listing, skipping`);
+            await page.close();
+            await randomDelay(delayBetweenRequests);
+            continue;
+          }
+
+          log(`  → ${sellersToVisit.size} 3P seller(s) to scrape`);
+
+          for (const [sellerId, meta] of sellersToVisit) {
+            await randomDelay(delayBetweenRequests);
+            const profile = await scrapeSellerProfile(page, sellerId, asin, marketplace);
+
+            const row = {
+              asin,
+              marketplace: marketplace.code,
+              domain: marketplace.domain,
+              source: meta.source,
+              sellerId,
+              sellerDisplayName: meta.name,
+              sellerName: profile?.sellerName || meta.name,
+              businessName: profile?.businessName || "",
+              businessType: profile?.businessType || "",
+              tradeRegisterNumber: profile?.tradeRegisterNumber || "",
+              vatNumber: profile?.vatNumber || "",
+              phone: profile?.phone || "",
+              email: profile?.email || "",
+              businessAddress: profile?.businessAddress || "",
+              customerServiceAddress: profile?.customerServiceAddress || "",
+              customerServicePhone: profile?.customerServicePhone || "",
+              shipsFrom: meta.shipsFrom || "",
+              price: meta.price || "",
+            };
+            results.push(row);
+          }
+
+          if (sellersToVisit.size === 0) {
+            results.push({
+              asin,
+              marketplace: marketplace.code,
+              domain: marketplace.domain,
+              source: primarySeller ? "buy_box" : "not_found",
+              sellerId: "",
+              sellerDisplayName: primarySeller?.name || "N/A",
+              sellerName: primarySeller?.name || "N/A",
+              businessName: "", businessType: "", tradeRegisterNumber: "",
+              vatNumber: "", phone: "", email: "", businessAddress: "",
+              customerServiceAddress: "", customerServicePhone: "",
+              shipsFrom: "", price: "",
+            });
+          }
+        } catch (err) {
+          log(`  ✗ Error: ${err.message}`);
+          results.push({
+            asin,
+            marketplace: marketplace.code,
+            domain: marketplace.domain,
+            source: "error",
+            error: err.message,
+            sellerId: "", sellerDisplayName: "", sellerName: "",
+            businessName: "", businessType: "", tradeRegisterNumber: "",
+            vatNumber: "", phone: "", email: "", businessAddress: "",
+            customerServiceAddress: "", customerServicePhone: "",
+            shipsFrom: "", price: "",
+          });
+        } finally {
           await page.close();
-          await randomDelay(delayBetweenRequests);
-          continue;
         }
 
-        log(`  → ${sellersToVisit.size} 3P seller(s) to scrape`);
-
-        // Step 3: Seller profiles
-        for (const [sellerId, meta] of sellersToVisit) {
-          await randomDelay(delayBetweenRequests);
-          const profile = await scrapeSellerProfile(page, sellerId, asin, marketplace);
-
-          await Actor.pushData({
-            asin,
-            marketplace: marketplace.code,
-            domain: marketplace.domain,
-            source: meta.source,
-            sellerId,
-            sellerDisplayName: meta.name,
-            sellerName: profile?.sellerName || meta.name,
-            businessName: profile?.businessName || "",
-            businessType: profile?.businessType || "",
-            tradeRegisterNumber: profile?.tradeRegisterNumber || "",
-            vatNumber: profile?.vatNumber || "",
-            phone: profile?.phone || "",
-            email: profile?.email || "",
-            businessAddress: profile?.businessAddress || "",
-            customerServiceAddress: profile?.customerServiceAddress || "",
-            customerServicePhone: profile?.customerServicePhone || "",
-            shipsFrom: meta.shipsFrom || "",
-            price: meta.price || "",
-          });
-        }
-
-        // Log empty row if no 3P sellers at all
-        if (sellersToVisit.size === 0) {
-          await Actor.pushData({
-            asin,
-            marketplace: marketplace.code,
-            domain: marketplace.domain,
-            source: primarySeller ? "buy_box" : "not_found",
-            sellerId: "",
-            sellerDisplayName: primarySeller?.name || "N/A",
-            sellerName: primarySeller?.name || "N/A",
-            businessName: "",
-            businessType: "",
-            tradeRegisterNumber: "",
-            vatNumber: "",
-            phone: "",
-            email: "",
-            businessAddress: "",
-            customerServiceAddress: "",
-            customerServicePhone: "",
-            shipsFrom: "",
-            price: "",
-          });
-        }
-      } catch (err) {
-        log(`  ✗ Error: ${err.message}`);
-        await Actor.pushData({
-          asin,
-          marketplace: marketplace.code,
-          domain: marketplace.domain,
-          source: "error",
-          error: err.message,
-          sellerId: "", sellerDisplayName: "", sellerName: "",
-          businessName: "", businessType: "", tradeRegisterNumber: "",
-          vatNumber: "", phone: "", email: "", businessAddress: "",
-          customerServiceAddress: "", customerServicePhone: "",
-          shipsFrom: "", price: "",
-        });
-      } finally {
-        await page.close();
+        await randomDelay(delayBetweenRequests);
       }
-
-      await randomDelay(delayBetweenRequests);
     }
+  } finally {
+    await browser.close();
   }
-} finally {
-  await browser.close();
+
+  log(`\n${"═".repeat(60)}`);
+  log(`DONE — ${results.length} rows`);
+  log(`${"═".repeat(60)}`);
+
+  return results;
 }
 
-log(`\n${"═".repeat(60)}`);
-log(`DONE`);
-log(`${"═".repeat(60)}`);
+// ─── HTTP SERVER ───────────────────────────────────────────────────────────────
 
-await Actor.exit();
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString()));
+      } catch {
+        resolve(null);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function json(res, status, data) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(data));
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+
+  // POST /run — start a scrape
+  if (req.method === "POST" && url.pathname === "/run") {
+    if (currentRun?.status === "running") {
+      return json(res, 409, {
+        error: "A run is already in progress",
+        startedAt: currentRun.startedAt,
+      });
+    }
+
+    const input = await readBody(req);
+    if (!input?.asins?.length) {
+      return json(res, 400, { error: "Missing 'asins' array in request body" });
+    }
+
+    currentRun = {
+      status: "running",
+      startedAt: new Date().toISOString(),
+      input,
+      results: [],
+      logs: [],
+      error: null,
+    };
+
+    json(res, 202, { status: "started", startedAt: currentRun.startedAt });
+
+    // Run in background
+    runScraper(input)
+      .then((results) => {
+        currentRun.status = "completed";
+        currentRun.results = results;
+        currentRun.completedAt = new Date().toISOString();
+      })
+      .catch((err) => {
+        currentRun.status = "failed";
+        currentRun.error = err.message;
+        currentRun.completedAt = new Date().toISOString();
+        console.error("Run failed:", err);
+      });
+
+    return;
+  }
+
+  // GET /status — check current/last run
+  if (req.method === "GET" && url.pathname === "/status") {
+    if (!currentRun) {
+      return json(res, 200, { status: "idle", message: "No runs yet" });
+    }
+    return json(res, 200, {
+      status: currentRun.status,
+      startedAt: currentRun.startedAt,
+      completedAt: currentRun.completedAt || null,
+      resultCount: currentRun.results.length,
+      logCount: currentRun.logs.length,
+      error: currentRun.error,
+    });
+  }
+
+  // GET /results — get results from last run
+  if (req.method === "GET" && url.pathname === "/results") {
+    if (!currentRun) {
+      return json(res, 200, { status: "idle", results: [] });
+    }
+    return json(res, 200, {
+      status: currentRun.status,
+      results: currentRun.results,
+    });
+  }
+
+  // GET /logs — get logs from current/last run
+  if (req.method === "GET" && url.pathname === "/logs") {
+    if (!currentRun) {
+      return json(res, 200, { logs: [] });
+    }
+    return json(res, 200, {
+      status: currentRun.status,
+      logs: currentRun.logs,
+    });
+  }
+
+  // GET / — health check
+  if (req.method === "GET" && url.pathname === "/") {
+    return json(res, 200, {
+      service: "amazon-seller-scraper",
+      status: currentRun?.status || "idle",
+      uptime: process.uptime(),
+    });
+  }
+
+  json(res, 404, { error: "Not found" });
+});
+
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+  console.log(`Endpoints:`);
+  console.log(`  POST /run     — start a scrape (body: { asins, maxAsins, marketplaces, ... })`);
+  console.log(`  GET  /status  — check run status`);
+  console.log(`  GET  /results — get results`);
+  console.log(`  GET  /logs    — get logs`);
+});
